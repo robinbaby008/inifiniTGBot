@@ -28,7 +28,7 @@ from pathlib import PurePosixPath
 
 import requests
 from dotenv import load_dotenv
-from telegram import Update
+from telegram import BotCommand, Update
 from telegram.ext import Application, CommandHandler, MessageHandler, ContextTypes, filters
 
 load_dotenv()
@@ -563,7 +563,15 @@ def main():
     if not WEBDAV_URL or not WEBDAV_USERNAME or not WEBDAV_PASSWORD:
         raise SystemExit("Missing WEBDAV_URL / WEBDAV_USERNAME / WEBDAV_PASSWORD in .env")
 
-    app = Application.builder().token(BOT_TOKEN).build()
+    async def post_init(app: Application):
+        # Registers commands so Telegram shows them in the "/" menu
+        await app.bot.set_my_commands([
+            BotCommand("start", "Start the bot / show help"),
+            BotCommand("help", "How to use the bot"),
+            BotCommand("ls", "List files in WebDAV folder"),
+        ])
+
+    app = Application.builder().token(BOT_TOKEN).post_init(post_init).build()
     app.add_handler(CommandHandler(["start", "help"], cmd_start))
     app.add_handler(CommandHandler("ls", cmd_ls))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_link))
