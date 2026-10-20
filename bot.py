@@ -37,6 +37,7 @@ from dotenv import load_dotenv
 from telegram import BotCommand, Update
 from telegram.error import Conflict
 from telegram.ext import Application, CommandHandler, MessageHandler, ContextTypes, filters
+from telegram.request import HTTPXRequest
 
 load_dotenv()
 
@@ -72,6 +73,23 @@ CHUNK = 256 * 1024  # 256 KB per chunk
 MAX_CONCURRENT = max(1, int(os.getenv("MAX_CONCURRENT_UPLOADS", "3")))
 MAX_LINKS_PER_MSG = max(1, int(os.getenv("MAX_LINKS_PER_MESSAGE", "10")))
 
+# Telegram's Bot API will not hand out a download URL for anything bigger than
+# this: getFile simply answers "File is too big". It is a platform limit, not a
+# bot setting -- a forwarded file over this size cannot be fetched by any bot,
+# however it is forwarded. Only a direct link gets around it, and those have no
+# size limit. Documented at core.telegram.org/bots/api#getfile
+TG_FILE_MAX_BYTES = 20 * 1000 * 1000
+
+# --- Telegram API timeouts ---
+# python-telegram-bot defaults all of these to 5s (1s for the pool wait), which
+# a VPN, a mobile link or a stuttering tunnel blows through -- and a single blown
+# timeout during startup used to crash the whole bot. Generous on purpose: a
+# Telegram API call taking 30s is slow, not broken. read_timeout must comfortably
+# exceed the long-poll window or every getUpdates would time out.
+TG_CONNECT_TIMEOUT = float(os.getenv("TG_CONNECT_TIMEOUT", "30"))
+TG_READ_TIMEOUT = float(os.getenv("TG_READ_TIMEOUT", "60"))
+TG_POOL_TIMEOUT = float(os.getenv("TG_POOL_TIMEOUT", "30"))
+
 # IMPORTANT requests gotcha: a (connect, read) tuple does NOT set a separate
 # write timeout. urllib3 keeps the socket at the *connect* value while it
 # streams the request body (only after the body is sent does it switch the
@@ -83,6 +101,12 @@ MAX_LINKS_PER_MSG = max(1, int(os.getenv("MAX_LINKS_PER_MESSAGE", "10")))
 STALL_TIMEOUT = max(30, int(os.getenv("STALL_TIMEOUT", "600")))  # 10 min
 PUT_TIMEOUT = (STALL_TIMEOUT, 60 * 60 * 6)   # (stall/write, read)
 GET_TIMEOUT = (15, int(os.getenv("SOURCE_READ_TIMEOUT", "60")))
+
+# Optional hard bandwidth cap for uploads, in MB/s. 0 / unset = unlimited.
+# Set it BELOW your real uplink speed: then teracloud's receive window never
+# fills, and the back-pressure failure described above cannot happen at all.
+# Shared by every concurrent job, so N jobs at a cap of M still total M.
+MAX_UPLOAD_SPEED_MBS = max(0.0, float(os.getenv("MAX_UPLOAD_SPEED_MBS", "0")))
 
 # --- cleanup / retention ---
 JOB_LOG_MAX_BYTES = max(1, int(os.getenv("JOB_LOG_MAX_BYTES", str(20 * 1024 * 1024))))
@@ -288,6 +312,8 @@ def record_event(job: dict, event: str, **extra):
         "done": p.get("done", 0),
         "total": p.get("total", 0),
         "seconds": round(extra.get("seconds", 0), 1),
+        "read_s": extra.get("read_s"),
+        "write_s": extra.get("write_s"),
         "error": extra.get("error"),
     }
     line = json.dumps(rec, ensure_ascii=False)
@@ -321,23 +347,64 @@ def emit_started(progress: dict, fname: str, dest_url: str):
 
 
 def read_history(user_id: int | None, limit: int = 20) -> list[dict]:
-    """Last `limit` records from the audit log, newest first."""
+    """The last `limit` matching records, in log order (oldest first).
+
+    Walks the file BACKWARDS in blocks and stops as soon as it has enough,
+    then flips back to log order for the caller. This is called from async
+    command handlers, and jobs.jsonl is allowed to grow to JOB_LOG_MAX_BYTES
+    (20 MB ~ 85k records), where parsing it front to back costs ~450 ms -- all
+    of it on the event loop, stalling progress updates and /cancel for a
+    running upload just to answer /history.
+
+    Log order (not newest first) is what callers expect: cmd_history reverses
+    it for display, and find_orphans builds a filename index either way.
+    """
+    if limit <= 0:
+        return []
     out: list[dict] = []
     try:
-        with open(JOB_LOG_PATH, "r", encoding="utf-8") as fh:
-            for line in fh:
-                line = line.strip()
-                if not line:
-                    continue
+        with open(JOB_LOG_PATH, "rb") as fh:
+            fh.seek(0, os.SEEK_END)
+            pos = fh.tell()
+            buf = b""
+            block = 64 * 1024
+            while pos > 0 and len(out) < limit:
+                step = min(block, pos)
+                pos -= step
+                fh.seek(pos)
+                buf = fh.read(step) + buf
+                lines = buf.split(b"\n")
+                # lines[0] is the oldest piece and may be a partial line whose
+                # start is in the previous block, so carry it forward.
+                buf = lines.pop(0)
+                for raw in reversed(lines):
+                    if not raw.strip():
+                        continue
+                    try:
+                        rec = json.loads(raw.decode("utf-8"))
+                    except Exception:
+                        continue
+                    # A log line is not guaranteed to be an object: a stray "5"
+                    # parses fine and would blow up .get() below.
+                    if not isinstance(rec, dict):
+                        continue
+                    if user_id is None or rec.get("user") == user_id:
+                        out.append(rec)
+                        if len(out) >= limit:
+                            break
+            # Reached the start of the file: whatever is left in buf is its
+            # first line, which never got a trailing newline to split on.
+            if len(out) < limit and buf.strip():
                 try:
-                    rec = json.loads(line)
+                    rec = json.loads(buf.decode("utf-8"))
                 except Exception:
-                    continue
-                if user_id is None or rec.get("user") == user_id:
+                    rec = None
+                if isinstance(rec, dict) and (user_id is None or rec.get("user") == user_id):
                     out.append(rec)
     except FileNotFoundError:
         return []
-    return out[-limit:]
+    out.reverse()  # collected newest -> oldest; hand back log order
+    return out
 
 
 def jobs_for_user(user_id: int) -> list[dict]:
@@ -378,6 +445,11 @@ def browser_headers(url: str) -> dict:
         "Accept-Language": "en-US,en;q=0.9",
         "Referer": referer,
         "Upgrade-Insecure-Requests": "1",
+        # requests otherwise advertises "gzip, deflate, zstd". Almost everything
+        # this bot moves is already-compressed media (mkv/mp4/zip), so the source
+        # either serves it as-is or burns CPU re-gzipping megabytes we will only
+        # push straight back out again. Identity avoids both.
+        "Accept-Encoding": "identity",
     }
 
 
@@ -446,8 +518,17 @@ def webdav_join(*parts: str) -> str:
     return base
 
 
+_WEBDAV_DIRS_READY: set[str] = set()
+
+
 def ensure_webdav_dir(session: requests.Session, dest_dir_url: str):
-    """MKCOL each level of WEBDAV_DIR. Ignore 405/201/200 (already exists)."""
+    """MKCOL each level of WEBDAV_DIR. Ignore 405/201/200 (already exists).
+
+    Successful collections are remembered: a MKCOL is one round trip per level
+    per job, which is pure overhead once the directory exists (and the bot can
+    run for days). Only a clear "this does not exist" answer is cached, so a
+    collection removed underneath us is still recreated.
+    """
     if not WEBDAV_DIR:
         return
     accum = WEBDAV_URL
@@ -456,9 +537,12 @@ def ensure_webdav_dir(session: requests.Session, dest_dir_url: str):
         if not part:
             continue
         accum = accum + urllib.parse.quote(part, safe="") + "/"
+        if accum in _WEBDAV_DIRS_READY:
+            continue
         try:
             r = session.request("MKCOL", accum, timeout=20)
             if r.status_code in (201, 200, 405, 409):
+                _WEBDAV_DIRS_READY.add(accum)
                 continue
             log.warning("MKCOL %s -> %s", accum, r.status_code)
         except Exception as e:
@@ -650,6 +734,8 @@ def _do_stream_upload(dl: requests.Session, dav: requests.Session, source_url: s
         progress["stage"] = "uploading"
         check_cancel()
         put = None
+        read_s = 0.0
+        t_put = time.monotonic()
         try:
             if total > 0:
                 # Sized stream -> requests sends Content-Length, no chunked encoding.
@@ -659,18 +745,28 @@ def _do_stream_upload(dl: requests.Session, dav: requests.Session, source_url: s
                 put = dav.put(dest_url, data=stream, headers=put_headers,
                               timeout=PUT_TIMEOUT)
                 downloaded = stream.done
+                read_s = stream.timing["read_s"]
             else:
                 # Unknown size -> true chunked upload
                 downloaded = 0
 
                 def gen():
-                    nonlocal downloaded
-                    for chunk in src.iter_content(chunk_size=CHUNK):
+                    nonlocal downloaded, read_s
+                    it = src.iter_content(chunk_size=CHUNK)
+                    while True:
+                        t0 = time.monotonic()
+                        try:
+                            chunk = next(it)
+                        except StopIteration:
+                            read_s += time.monotonic() - t0
+                            return
+                        read_s += time.monotonic() - t0
                         if not chunk:
                             continue
                         check_cancel()
                         downloaded += len(chunk)
                         progress["done"] = downloaded
+                        _BANDWIDTH.consume(len(chunk))
                         yield chunk
 
                 put = dav.put(dest_url, data=gen(), headers=put_headers,
@@ -694,9 +790,17 @@ def _do_stream_upload(dl: requests.Session, dav: requests.Session, source_url: s
             delete_partial_if_incomplete(dav, dest_url, total)
             raise
 
+        # http.client.send() only ever does read() then sendall(), so whatever
+        # the PUT took that was NOT spent blocked on the source socket was spent
+        # writing to teracloud. That split is the whole diagnostic.
+        put_s = time.monotonic() - t_put
+        timing = {"read_s": round(read_s, 2),
+                  "write_s": round(max(0.0, put_s - read_s), 2)}
+
         webdav_path = f"{WEBDAV_DIR}/{fname}" if WEBDAV_DIR else fname
         return {"filename": fname, "size": downloaded, "total": total,
-                "webdav_url": dest_url, "webdav_path": webdav_path}
+                "webdav_url": dest_url, "webdav_path": webdav_path,
+                "timing": timing}
 
 
 def delete_quietly(session: requests.Session, url: str):
@@ -752,6 +856,9 @@ class _UploadStream:
         self.cancel = cancel
         self._it = resp.iter_content(chunk_size=CHUNK)
         self.done = 0
+        # Seconds spent blocked waiting on the source. Subtracted from the PUT
+        # wall time to isolate the socket-write cost -- see fmt_timing.
+        self.timing = {"read_s": 0.0}
 
     def __len__(self):
         return int(self.resp.headers.get("Content-Length") or 0)
@@ -759,15 +866,47 @@ class _UploadStream:
     def read(self, size=-1):  # noqa: ANN001 - requests calls read(chunk_size)
         if self.cancel is not None and self.cancel.is_set():
             raise UploadCancelled()
+        t0 = time.monotonic()
         try:
             chunk = next(self._it)
         except StopIteration:
-            return b""
+            chunk = None
+        self.timing["read_s"] += time.monotonic() - t0
         if not chunk:
             return b""
         self.done += len(chunk)
         self.progress["done"] = self.done
+        _BANDWIDTH.consume(len(chunk))
         return chunk
+
+
+class _BandwidthCap:
+    """Global upload rate cap in bytes/sec. A bps of 0 disables it entirely.
+
+    Virtual-scheduling limiter: each caller claims a slot due no earlier than
+    the previous one's deadline plus the time its bytes are entitled to, then
+    sleeps until that slot. Uploads run on worker threads, so the claim is made
+    under a lock but the sleep happens outside it, otherwise one capped upload
+    would freeze the others while it waits.
+    """
+
+    def __init__(self, bps: float):
+        self.bps = bps
+        self._lock = threading.Lock()
+        self._due = 0.0
+
+    def consume(self, n: int) -> None:
+        if self.bps <= 0 or n <= 0:
+            return
+        with self._lock:
+            now = time.monotonic()
+            due = max(now, self._due)
+            self._due = due + n / self.bps
+        if due > now:
+            time.sleep(due - now)
+
+
+_BANDWIDTH = _BandwidthCap(MAX_UPLOAD_SPEED_MBS * 1024 * 1024)
 
 
 def fmt_size(n: int) -> str:
@@ -780,6 +919,22 @@ def fmt_size(n: int) -> str:
     return f"{n:.1f} PB"
 
 
+def fmt_size_si(n: int) -> str:
+    """Decimal sizes, so they line up with Telegram's own '20 MB' wording.
+
+    fmt_size is binary (1 MB = 1048576), which would render the 20000000-byte
+    Telegram cap as "19.1 MB" -- smaller than the limit, next to a file that was
+    just rejected for being over it.
+    """
+    if not n:
+        return "?"
+    for unit in ("B", "KB", "MB", "GB", "TB"):
+        if n < 1000:
+            return f"{n:.1f} {unit}"
+        n /= 1000
+    return f"{n:.1f} PB"
+
+
 def fmt_bar(done: int, total: int, width: int = 12) -> str:
     if not total:
         mb = done / 1048576
@@ -789,7 +944,151 @@ def fmt_bar(done: int, total: int, width: int = 12) -> str:
     return f"[{'█' * filled}{'░' * (width - filled)}] {pct}% ({fmt_size(done)}/{fmt_size(total)})"
 
 
+def fmt_timing(size: int, timing: dict) -> str:
+    """Say where the transfer time went: waiting on the source, or on teracloud.
+
+    The two stages are strictly serial today (http.client.send() alternates
+    read/sendall), so they add up. Pipelining them would give the faster stage,
+    i.e. min(read_s, write_s) worth of one megabyte -- hence the factor printed
+    at the end. A factor near 1.0 means rewriting the transfer loop would win
+    nothing; a large one means overlapping download and upload is worth doing.
+    """
+    rs = float(timing.get("read_s") or 0.0)
+    ws = float(timing.get("write_s") or 0.0)
+    total = rs + ws
+    if size <= 0 or total <= 0:
+        return ""
+
+    def rate(secs: float) -> str:
+        return f"{size / secs / 1048576:.1f} MB/s" if secs > 0 else "instant"
+
+    bottleneck = "source" if rs >= ws else "teracloud"
+    slower = min(rs, ws)
+    # When one stage is effectively free the other already sets the pace, so
+    # overlapping buys nothing -- report 1.0x rather than dividing by ~0 and
+    # printing a nonsense factor.
+    gain = total / slower if slower >= total * 0.05 else 1.0
+    return (f"source {rs:.1f}s ({rate(rs)}) | "
+            f"teracloud {ws:.1f}s ({rate(ws)}) | "
+            f"bottleneck={bottleneck} | pipelining would give ~{gain:.1f}x")
+
+
 # ---------- webdav listing ----------
+
+def webdav_speed_test(size_mb: int, rounds: int, budget: float) -> dict:
+    """Measure upload throughput to the WebDAV host, with no source involved.
+
+    This isolates the teracloud half of a transfer -- the half that decides how
+    long a real job takes. Every round writes a throwaway file and deletes it
+    again straight away, so nothing is left for /clean to trip over. Payload is
+    os.urandom so an over-eager server cannot cheat by storing zeros.
+    """
+    sess = requests.Session()
+    sess.auth = (WEBDAV_USERNAME, WEBDAV_PASSWORD)
+    payload = os.urandom(size_mb * 1024 * 1024)
+    out: dict = {"size_mb": size_mb, "rounds": [], "rtt_ms": None, "errors": []}
+    stamp = time.strftime("%Y%m%d-%H%M%S")
+
+    # min() over a few tiny round trips: the floor of the path latency, with
+    # queueing noise from any one of them averaged away.
+    rtts = []
+    probe = webdav_join(WEBDAV_DIR, f".infi-speedprobe-{stamp}")
+    for _ in range(3):
+        t0 = time.monotonic()
+        try:
+            sess.head(probe, timeout=20)
+        except Exception:
+            break
+        rtts.append(time.monotonic() - t0)
+    if rtts:
+        out["rtt_ms"] = round(min(rtts) * 1000)
+
+    written = []
+    spent = 0.0
+    try:
+        for i in range(rounds):
+            url = webdav_join(WEBDAV_DIR, f".infi-speedtest-{stamp}-{i}")
+            written.append(url)
+            t0 = time.monotonic()
+            try:
+                r = sess.put(url, data=payload, timeout=(STALL_TIMEOUT, 300),
+                             headers={"Content-Type": "application/octet-stream"})
+                dt = time.monotonic() - t0
+                r.raise_for_status()
+            except Exception as e:
+                # Stop, but keep whatever rounds already succeeded -- a single
+                # rejected PUT (quota, 507) should not throw away a measurement
+                # that is otherwise perfectly usable.
+                out["errors"].append(f"{type(e).__name__}: {e}")
+                break
+            out["rounds"].append({"mb": size_mb, "seconds": dt})
+            spent += dt
+            if spent >= budget:
+                break
+    finally:
+        # Covers a half-written file too: these are ours and throwaway.
+        for u in written:
+            delete_quietly(sess, u)
+        sess.close()
+    return out
+
+
+def fmt_speed_test(res: dict) -> str:
+    """Report the spread, not just one number.
+
+    Two rounds of the same payload can differ by 2x on a lossy high-latency
+    path, and averaging that away hides the thing worth knowing: that the link
+    is dropping packets and the congestion window is collapsing between bursts.
+    """
+    rounds = res["rounds"]
+    if not rounds:
+        return "❌ No successful round -- check the WebDAV URL/credentials in .env."
+    speeds = sorted(r["mb"] / r["seconds"] for r in rounds)
+    best, worst = speeds[-1], speeds[0]
+    n = len(speeds)
+    # True median, averaging the middle pair on an even count -- picking the
+    # upper one would report "typical" as the best result and hide the spread.
+    mid = speeds[n // 2] if n % 2 else (speeds[n // 2 - 1] + speeds[n // 2]) / 2
+    gib = 1024 ** 3
+    mins = gib / (best * 1048576) / 60
+    est = f"{mins:.0f} min" if mins < 90 else f"{mins / 60:.1f} h"
+
+    lines = ["\U0001f680 InfiCloud upload speed", ""]
+    for i, r in enumerate(rounds, 1):
+        lines.append(f"Round {i}: {r['mb']:>4} MB in "
+                     f"{r['seconds']:6.1f}s  =  {r['mb'] / r['seconds']:.2f} MB/s")
+    lines += ["",
+              f"Best:    {best:.2f} MB/s",
+              f"Typical: {mid:.2f} MB/s   (median)",
+              f"Worst:   {worst:.2f} MB/s"]
+    if res.get("rtt_ms"):
+        lines.append(f"Round trip: {res['rtt_ms']} ms")
+
+    notes = []
+    ratio = best / worst if worst > 0 else 1.0
+    if len(speeds) > 1 and ratio >= 1.5:
+        notes.append(f"\U0001f534 Unsteady: rounds differ by {ratio:.1f}x. That is "
+                     "packet loss, not bandwidth — TCP's congestion window is "
+                     "collapsing and re-growing between bursts, so treat the "
+                     "figure as a range.")
+    if res.get("rtt_ms", 0) >= 120:
+        notes.append(f"\U0001f7e1 Path latency is {res['rtt_ms']} ms, so TCP needs "
+                     "several round trips just to fill its window. A small "
+                     "sample measures that ramp more than the line itself — run "
+                     "/speed 64 for a steady-state number.")
+    if notes:
+        lines += [""] + notes
+    if res.get("errors"):
+        lines.append(f"⚠️ a round failed — first: {res['errors'][0][:120]}")
+    lines += ["", f"1 GB would take about {est} at the best rate.", ""]
+    lines.append(f"Target: {WEBDAV_URL}{WEBDAV_DIR + '/' if WEBDAV_DIR else ''}")
+    if MAX_UPLOAD_SPEED_MBS:
+        # Would otherwise look like the cap is being ignored -- it isn't: this
+        # test talks to WebDAV directly and never passes through _BandwidthCap.
+        lines.append(f"(MAX_UPLOAD_SPEED_MBS={MAX_UPLOAD_SPEED_MBS:g} is set. "
+                     "It does not apply here, nor to real uploads above it.)")
+    return "\n".join(lines)
+
 
 def list_webdav() -> list[dict]:
     """PROPFIND the target dir -> [{name, dir, size, mtime}].
@@ -845,8 +1144,9 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         "👋 Send me a direct download link and I'll upload it straight to InfiniCloud WebDAV.\n\n"
         "• Just paste one or more http(s) links — up to 10, "
         f"{MAX_CONCURRENT} upload in parallel\n"
-        "• Or forward files (Telegram size limits apply)\n"
+        "• Or forward files — up to 20 MB, Telegram's cap on what a bot can download\n"
         "• /ls — list files in your WebDAV folder\n"
+        "• /speed — test your upload speed to InfiCloud (/speed 32 for a bigger run)\n"
         "• /jobs — see uploads in progress\n"
         "• /cancel — stop one (/cancel <id>) or all (/cancel all)\n"
         "• /clean — find orphan/partial files (add: orphans, log, all)\n\n"
@@ -875,6 +1175,40 @@ async def cmd_ls(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("✅ Got listing (format failed). Check WebDAV in browser.")
 
 
+async def cmd_speed(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """/speed [MB] -- how fast the bot can push to InfiniCloud, right now."""
+    if not is_allowed(update):
+        await update.message.reply_text("⛔ Not authorized.")
+        return
+    # /speed 32 for a bigger sample; clamped so it can't turn into a giant upload.
+    size_mb = 8
+    if ctx.args:
+        try:
+            size_mb = int(ctx.args[0])
+        except ValueError:
+            await update.message.reply_text("Usage: /speed [MB]  (e.g. /speed 32)")
+            return
+        if not 1 <= size_mb <= 512:
+            await update.message.reply_text("Please choose between 1 and 512 MB.")
+            return
+    busy = len(JOBS)
+    msg = await update.message.reply_text(
+        f"🚀 Testing upload to InfiniCloud ({size_mb} MB per round)…")
+    try:
+        res = await asyncio.to_thread(webdav_speed_test, size_mb, 5, 20.0)
+    except Exception as e:
+        await update.message.reply_text(f"❌ Speed test failed: {e}")
+        return
+    text = fmt_speed_test(res)
+    if busy:
+        text += f"\n\n⚠️ {busy} upload(s) were running during this test and were " \
+                "sharing the same line — the numbers are a floor, not your ceiling."
+    try:
+        await msg.edit_text(text)
+    except Exception:
+        await update.message.reply_text(text)
+
+
 async def handle_link(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not is_allowed(update):
         await update.message.reply_text("⛔ Not authorized.")
@@ -896,6 +1230,30 @@ async def handle_link(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     )
 
 
+def tg_oversize_message(size: int) -> str:
+    """Explain the Telegram file cap instead of leaking a bare 400 at the user."""
+    what = fmt_size_si(size) if size > 0 else "an unknown size"
+    return (
+        f"\U0001f4e6 That file is {what}, but Telegram only lets bots download "
+        f"files up to {fmt_size_si(TG_FILE_MAX_BYTES)}.\n"
+        "It's a Telegram limit rather than a problem here — forwarding it "
+        "another way won't help.\n\n"
+        "Send a direct http(s) download link instead. Links have no size limit "
+        "(a multi-GB one has uploaded fine)."
+    )
+
+
+def is_too_big_error(e: Exception) -> bool:
+    """True when Telegram refused getFile because the file exceeds its cap.
+
+    Matched on wording rather than on telegram.error.BadRequest: this try block
+    only ever calls get_file(), so the phrase is unambiguous, and it keeps
+    working if the exception type or message wording shifts between API versions.
+    """
+    msg = str(e).lower()
+    return "too big" in msg or "too large" in msg
+
+
 async def handle_file(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     """Also accept files sent directly to the bot (Telegram file -> WebDAV)."""
     if not is_allowed(update):
@@ -909,6 +1267,12 @@ async def handle_file(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return
     if isinstance(doc, (list, tuple)):  # photo returns list of sizes
         doc = doc[-1]
+    size = getattr(doc, "file_size", 0) or 0
+    # The update carries the size even though the bytes are unreachable, so say
+    # so up front instead of letting get_file() fail with an opaque error.
+    if size > TG_FILE_MAX_BYTES:
+        await update.message.reply_text(tg_oversize_message(size))
+        return
     try:
         tg_file = await doc.get_file()
         file_url = tg_file.file_path  # direct https URL (includes token)
@@ -918,6 +1282,12 @@ async def handle_file(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         spawn(process_one_url(update, ctx, file_url, hint_name=getattr(doc, "file_name", None)))
         await update.message.reply_text("📥 Queued. /jobs to watch, /cancel all to stop.")
     except Exception as e:
+        # Belt and braces: the cap is enforced server-side and may not match the
+        # constant above exactly, and file_size can be absent. Let Telegram's
+        # own verdict win rather than second-guessing it.
+        if is_too_big_error(e):
+            await update.message.reply_text(tg_oversize_message(size))
+            return
         await update.message.reply_text(f"❌ Could not read Telegram file: {e}")
 
 
@@ -969,9 +1339,14 @@ async def process_one_url(update: Update, ctx: ContextTypes.DEFAULT_TYPE, url: s
             dt = time.time() - t0
             speed = result["size"] / dt / 1048576 if dt > 0 and result["size"] else 0
             record_event(job, "done", filename=result["filename"],
-                         seconds=dt, size=result["size"])
+                         seconds=dt, size=result["size"],
+                         read_s=result.get("timing", {}).get("read_s"),
+                         write_s=result.get("timing", {}).get("write_s"))
             log.info("job #%s done: %s (%s in %.0fs, %.1f MB/s)", job["id"],
                      result["filename"], fmt_size(result["size"]), dt, speed)
+            detail = fmt_timing(result["size"], result.get("timing") or {})
+            if detail:
+                log.info("job #%s timing: %s", job["id"], detail)
             await status.edit_text(
                 f"✅ Uploaded to InfiniCloud! (job #{job['id']})\n"
                 f"📄 {result['filename']}\n"
@@ -1045,13 +1420,15 @@ async def cmd_history(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     args = ctx.args or []
     limit = int(args[0]) if args and args[0].isdigit() else 20
     limit = max(1, min(limit, 50))
-    recs = read_history(user_id, limit)
+    # One read serves both the listing and the tally. They used to be two
+    # full-file parses of jobs.jsonl, back to back, on the event loop.
+    recs = await asyncio.to_thread(read_history, user_id, max(limit, 200))
     if not recs:
         await update.message.reply_text("📭 No job history recorded yet.")
         return
-    body = "\n".join(history_line(r) for r in reversed(recs))
+    body = "\n".join(history_line(r) for r in reversed(recs[:limit]))
     counts: dict[str, int] = {}
-    for r in read_history(user_id, 200):
+    for r in recs[:200]:
         counts[r.get("event", "?")] = counts.get(r.get("event", "?"), 0) + 1
     tally = " · ".join(f"{ICON.get(k, '•')} {counts[k]}" for k in
                        ("done", "failed", "cancelled") if counts.get(k))
@@ -1151,7 +1528,12 @@ async def cmd_clean(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text(f"❌ Could not list WebDAV: {e}")
             return
         # Every user's records: an orphan may predate this bot's job numbering.
-        orphans = find_orphans(entries, read_history(None, JOB_LOG_KEEP))
+        # Reading the log and classifying against up to JOB_LOG_KEEP records is
+        # far too slow to sit on the event loop, so it runs in a worker.
+        def _find_orphans():
+            return find_orphans(entries, read_history(None, JOB_LOG_KEEP))
+
+        orphans = await asyncio.to_thread(_find_orphans)
         files = [e for e in entries if not e["dir"]]
         if not orphans:
             summary += (f"🧹 Clean: {len(files)} file(s) scanned, "
@@ -1298,16 +1680,24 @@ def main():
     async def post_init(app: Application):
         global JOB_SEM
         JOB_SEM = asyncio.Semaphore(MAX_CONCURRENT)
-        # Registers commands so Telegram shows them in the "/" menu
-        await app.bot.set_my_commands([
-            BotCommand("start", "Start the bot / show help"),
-            BotCommand("help", "How to use the bot"),
-            BotCommand("ls", "List files in WebDAV folder"),
-            BotCommand("jobs", "Show uploads in progress"),
-            BotCommand("history", "Past jobs, incl. failures"),
-            BotCommand("cancel", "Cancel an upload: /cancel [id|all]"),
-            BotCommand("clean", "Find orphan/partial files, tidy logs"),
-        ])
+        # Registers commands so Telegram shows them in the "/" menu. Purely
+        # cosmetic, and it used to be the one call that could kill startup: a
+        # timed-out set_my_commands took the whole bot down with it. Losing the
+        # menu must never stop the bot from serving uploads.
+        try:
+            await app.bot.set_my_commands([
+                BotCommand("start", "Start the bot / show help"),
+                BotCommand("help", "How to use the bot"),
+                BotCommand("ls", "List files in WebDAV folder"),
+                BotCommand("speed", "Test upload speed to InfiCloud: /speed [MB]"),
+                BotCommand("jobs", "Show uploads in progress"),
+                BotCommand("history", "Past jobs, incl. failures"),
+                BotCommand("cancel", "Cancel an upload: /cancel [id|all]"),
+                BotCommand("clean", "Find orphan/partial files, tidy logs"),
+            ])
+        except Exception as e:
+            log.warning("could not register the command menu "
+                        "(cosmetic only, the bot still works): %s", e)
 
     async def post_shutdown(app: Application):
         # Ask every in-flight upload to stop so nothing is left half-written.
@@ -1332,9 +1722,24 @@ def main():
         log.error("update error: %s", err, exc_info=err)
 
 
-    app = Application.builder().token(BOT_TOKEN).post_init(post_init).post_shutdown(post_shutdown).build()
+    # python-telegram-bot defaults every Telegram timeout to 5s and the pool
+    # wait to 1s. On a VPN, a mobile link or a briefly stuttering tunnel that is
+    # easily exceeded, and the consequence was a hard crash at startup. These are
+    # generous on purpose: a Telegram API call taking 30s is slow, not broken.
+    # read_timeout must comfortably exceed the long-poll window or every getUpdates
+    # would time out. 64 connections is far above the ~3+1 this bot needs.
+    tg_request = HTTPXRequest(
+        connection_pool_size=64,
+        connect_timeout=TG_CONNECT_TIMEOUT,
+        read_timeout=TG_READ_TIMEOUT,
+        write_timeout=TG_CONNECT_TIMEOUT,
+        pool_timeout=TG_POOL_TIMEOUT,
+    )
+
+    app = Application.builder().token(BOT_TOKEN).request(tg_request).post_init(post_init).post_shutdown(post_shutdown).build()
     app.add_handler(CommandHandler(["start", "help"], cmd_start))
     app.add_handler(CommandHandler("ls", cmd_ls))
+    app.add_handler(CommandHandler("speed", cmd_speed))
     app.add_handler(CommandHandler("jobs", cmd_jobs))
     app.add_handler(CommandHandler("history", cmd_history))
     app.add_handler(CommandHandler("cancel", cmd_cancel))

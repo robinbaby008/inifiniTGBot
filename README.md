@@ -12,11 +12,12 @@ Extras:
 
 - **Multiple files at once** — paste up to `MAX_LINKS_PER_MESSAGE` links in one message; they are queued as separate jobs and `MAX_CONCURRENT_UPLOADS` of them upload in parallel.
 - **`/jobs`** — lists every upload in progress with its live progress bar, stage and elapsed time.
+- **`/speed [MB]`** — measures how fast the bot can actually push to InfiniCloud *right now*, with no source download in the way, so you get the teracloud half of the transfer on its own. Writes a throwaway `os.urandom` payload (8 MB × up to 5 by default) and deletes it immediately. It reports every round, the median, and the spread, and then says what the spread *means*: rounds differing by 1.5x or more are flagged as packet loss (TCP's congestion window collapsing and re-growing) rather than a bandwidth limit, and a high round-trip time is flagged as ramp-up dominating a small sample. Run it with no upload going for a true ceiling — the command warns you if one is running, since they share the line. On a high-latency path prefer `/speed 64`, because an 8 MB sample mostly measures TCP filling its window.
 - **`/cancel`** — cancels your newest upload, `/cancel <id>` a specific one, `/cancel all` every one of yours. Cancellation lands at the next 256 KB chunk and aborts the PUT.
 - **`/history [n]`** — every finished job, success **or** failure **or** cancel, re-read from `jobs.jsonl` on disk. Survives restarts, unlike `/jobs`.
 - **`/clean`** — reports orphan/partial files left on WebDAV. **Dry run by default.** Add `orphans` to delete, `log` to compact logs, `all` for both.
 - `/ls` lists files in your WebDAV folder (via `PROPFIND`).
-- Files sent directly to the bot are also forwarded to WebDAV (Telegram size limits apply; links bypass that).
+- Files sent directly to the bot are also forwarded to WebDAV, **but only up to 20 MB** — Telegram's Bot API will not give a bot a download URL for anything larger, so this is a hard platform limit and no amount of forwarding differently changes it. Links have no such limit, which is why the link path is the primary one. (Lifting the cap is only possible by self-hosting [telegram-bot-api](https://github.com/tdlib/telegram-bot-api) with `--local`, which raises it to ~2 GB — out of scope here.)
 - Cloudflare-protected pages are detected and the bot tries a `yt-dlp` fallback to resolve the real file URL.
 
 ## Requirements
@@ -44,6 +45,7 @@ cp .env.example .env
 | `MAX_LINKS_PER_MESSAGE` | `10` | Optional. Links taken from one message. Default `10` |
 | `STALL_TIMEOUT` | `600` | Optional. Seconds of zero write progress before aborting. Default `600` |
 | `SOURCE_READ_TIMEOUT` | `60` | Optional. Seconds the source may stall mid-download. Default `60` |
+| `MAX_UPLOAD_SPEED_MBS` | `0` | Optional. Hard upload cap in MB/s, shared by all concurrent jobs. `0` = unlimited |
 | `CLEAN_MAX_AGE_HOURS` | `24` | Optional. Age gate for weak orphan signals. Default `24` |
 | `CLEAN_WEAK` | `1` | Optional. `0` = only delete proven orphans. Default `1` |
 | `CLEAN_MAX_DELETES` | `200` | Optional. Cap per `/clean orphans` run. Default `200` |
@@ -108,14 +110,29 @@ python bot.py --log bot.log
 
 ## Troubleshooting
 
+Every finished job logs where its time went, e.g.
+
+```
+job #4 timing: source 1502.7s (3.2 MB/s) | teracloud 1898.3s (2.5 MB/s) | bottleneck=teracloud | pipelining would give ~1.8x
+```
+
+`read_s` is time blocked waiting on the source, `write_s` is everything else in the PUT
+(so, writing to InfiniCloud). The bot pulls and pushes strictly one after the other,
+so the two add up; overlapping them would give the *faster* of the two — that is what
+the last number is. A `~1.0x` means a faster link is the only fix, a large one means
+the transfer loop is worth rewriting. The same two numbers are also stored per job in
+`jobs.jsonl` (`read_s` / `write_s`), so you can compare before/after changing anything
+else (a different network, BBR, and so on).
+
 | Symptom | Fix |
 |---|---|
 | `externally-managed-environment` on `pip install` | Use the `.venv` steps above, never `--break-system-packages`. |
 | `403 ... Just a moment...` | Cloudflare challenge — send the final direct CDN URL instead. |
 | `WebDAV PUT failed (400)` | Fixed: uploader now sends a clean `Content-Length` (no chunked+length combo). Update to latest `bot.py`. |
+| `Could not read Telegram file: File is too big` | Telegram caps what a bot can download at **20 MB**. Not fixable in this bot — send a direct link instead, which has no size limit. |
 | `Missing TELEGRAM_BOT_TOKEN / WEBDAV_* in .env` | `.env` missing or empty — copy from `.env.example` and fill it. |
 | `Conflict: terminated by other getUpdates request` | **Two instances of the bot are running.** Only one can hold the getUpdates lock, so commands go to whichever wins and the loser serves nothing. Check with `pgrep -af bot.py` and kill the extra. |
-| `The write operation timed out` | TCP back-pressure: teracloud stopped draining the socket for longer than `STALL_TIMEOUT`. Two parallel multi-GB uploads saturating one uplink is the usual cause — lower `MAX_CONCURRENT_UPLOADS`. |
+| `The write operation timed out` | TCP back-pressure: teracloud stopped draining the socket for longer than `STALL_TIMEOUT`. Two parallel multi-GB uploads saturating one uplink is the usual cause — lower `MAX_CONCURRENT_UPLOADS`, or set `MAX_UPLOAD_SPEED_MBS` below your uplink speed so the socket can never back up. |
 
 ## Failure isolation
 
